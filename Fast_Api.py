@@ -169,12 +169,16 @@ def distribution_graph(req: DistGraphRequest):
             y = stats.binom.pmf(x, n_val, p_val) if is_pdf else stats.binom.cdf(x, n_val, p_val)
             ax.bar(x, y, color=color, alpha=0.7, width=0.6)
             
-        ax.set_title(f"{c} - {req.func_type}", fontsize=11, color='#1E3A5F')
+        # 한글을 제거하고 영어 이름만 추출하여 제목으로 설정
+        eng_title = c.split("(")[1].replace(")", "") if "(" in c else c
+        ax.set_title(f"{eng_title} - {req.func_type}", fontsize=11, color='#1E3A5F') # <--- 이렇게 수정하세요!
+        
         ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
         ax.grid(True, linestyle='--', alpha=0.4)
         
         return {"success": True, "image": fig_to_base64(fig)}
+
     except Exception as e:
         return {"error": str(e)}
 
