@@ -55,6 +55,8 @@ class RegressionRequest(BaseModel):
     b: float
     sigma: float
     n: int
+    point_color: str  # 추가됨
+    line_color: str   # 추가됨
 
 # 공통 함수: 그래프를 Base64 이미지로 변환
 def fig_to_base64(fig):
@@ -253,9 +255,10 @@ def regression_analysis(req: RegressionRequest):
         res = stats.linregress(x, y)
         
         fig, ax = plt.subplots(figsize=(5, 3))
-        ax.scatter(x, y, color='#2E86AB', alpha=0.6, s=30, edgecolors='none')
+        # 색상 변수 적용
+        ax.scatter(x, y, color=req.point_color, alpha=0.6, s=30, edgecolors='none')
         x_line = np.linspace(np.min(x), np.max(x), 100)
-        ax.plot(x_line, res.slope * x_line + res.intercept, color='#E74C3C', linewidth=2.5)
+        ax.plot(x_line, res.slope * x_line + res.intercept, color=req.line_color, linewidth=2.5)
         ax.set_title("Linear Regression", fontsize=11)
         ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
