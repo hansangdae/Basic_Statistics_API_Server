@@ -1,17 +1,19 @@
 # api.py
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import numpy as np
 import scipy.stats as stats
+import matplotlib
+matplotlib.use("agg") # 서버 환경에서 그래프를 그리기 위한 필수 설정
 import matplotlib.pyplot as plt
 import seaborn as sns
 import base64
 import io
-import json
 
-app = FastAPI(title="Statistics Learning API")
+app = FastAPI(title="Statistics API Server")
 
-# CORS 설정 (모바일 앱에서 요청을 받을 수 있게)
+# 모바일 앱에서 접속할 수 있도록 CORS 허용
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,388 +25,246 @@ app.add_middleware(
 plt.rcParams['font.family'] = 'sans-serif'
 plt.rcParams['axes.unicode_minus'] = False
 
-# ==========================================
-# 탭 1: 데이터 생성 엔드포인트
-# ==========================================
-@app.post("/api/generate-data")
-def generate_data(
-    dist_type: str,
-    dist_choice: str,
-    params: dict,
+# 데이터 모델 정의
+class GenerateDataRequest(BaseModel):
+    dist_choice: str
+    params: dict
     n_samples: int
-):
-    """
-    확률분포에서 샘플 데이터를 생성합니다.
-    
-    예: 
-    {
-        "dist_type": "연속분포 (Continuous)",
-        "dist_choice": "정규분포 (Normal)",
-        "params": {"평균 (μ)": 0, "표준편차 (σ)": 1},
-        "n_samples": 100
-    }
-    """
+
+class DescriptiveRequest(BaseModel):
+    data: list
+    bins: int
+    bar_color: str
+    curve_color: str
+
+class DistGraphRequest(BaseModel):
+    dist_choice: str
+    params: dict
+    func_type: str
+    line_color: str
+
+class HypothesisRequest(BaseModel):
+    data: list
+    h0_val: float
+    analysis_mode: str
+    test_type: str
+    alpha: float
+
+class RegressionRequest(BaseModel):
+    a: float
+    b: float
+    sigma: float
+    n: int
+
+# 공통 함수: 그래프를 Base64 이미지로 변환
+def fig_to_base64(fig):
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", facecolor='white')
+    buf.seek(0)
+    img_base64 = base64.b64encode(buf.read()).decode("utf-8")
+    plt.close(fig)
+    return img_base64
+
+@app.get("/")
+def read_root():
+    return {"status": "API Server is Running!"}
+
+# 1단계: 데이터 생성
+@app.post("/api/generate")
+def generate_data(req: GenerateDataRequest):
     try:
         np.random.seed()
+        n = req.n_samples
+        p = req.params
+        c = req.dist_choice
         
-        if "정규분포" in dist_choice:
-            data = np.random.normal(
-                params["평균 (μ)"], 
-                params["표준편차 (σ)"], 
-                n_samples
-            )
-        elif "지수분포" in dist_choice:
-            data = np.random.exponential(
-                1/params["비율 모수 (λ)"], 
-                n_samples
-            )
-        elif "이항분포" in dist_choice:
-            data = np.random.binomial(
-                int(params["시행 횟수 (n)"]), 
-                params["성공 확률 (p)"], 
-                n_samples
-            )
-        elif "포아송" in dist_choice:
-            data = np.random.poisson(
-                params["발생률 (λ)"], 
-                n_samples
-            )
-        elif "t-분포" in dist_choice:
-            data = np.random.standard_t(
-                int(params["자유도 (df)"]), 
-                n_samples
-            )
-        elif "카이제곱" in dist_choice:
-            data = np.random.chisquare(
-                int(params["자유도 (df)"]), 
-                n_samples
-            )
-        else:
-            return {"error": "Unknown distribution"}
+        if "정규분포" in c: data = np.random.normal(p["평균 (μ)"], p["표준편차 (σ)"], n)
+        elif "지수분포" in c: data = np.random.exponential(1/p["비율 모수 (λ)"], n)
+        elif "이항분포" in c: data = np.random.binomial(int(p["시행 횟수 (n)"]), p["성공 확률 (p)"], n)
+        elif "포아송" in c: data = np.random.poisson(p["평균 발생률 (λ)"], n)
+        elif "t-분포" in c: data = np.random.standard_t(int(p["자유도 (df)"]), n)
+        elif "카이제곱" in c: data = np.random.chisquare(int(p["자유도 (df)"]), n)
+        else: return {"error": "알 수 없는 분포입니다."}
         
-        return {
-            "success": True,
-            "data": data.tolist(),
-            "count": len(data)
-        }
+        return {"success": True, "data": data.tolist()}
     except Exception as e:
         return {"error": str(e)}
 
-# ==========================================
-# 탭 2: 기술통계량 계산 엔드포인트
-# ==========================================
-@app.post("/api/descriptive-stats")
-def descriptive_stats(data: list):
-    """
-    입력된 데이터의 기술통계량을 계산하고 히스토그램을 그립니다.
-    """
+# 2단계: 기술통계량 및 그래프
+@app.post("/api/descriptive")
+def descriptive_stats(req: DescriptiveRequest):
     try:
-        data = np.array(data)
-        data = data[np.isfinite(data)]
+        data = np.array(req.data)
+        if len(data) < 2: return {"error": "데이터가 2개 이상 필요합니다."}
         
-        if len(data) < 2:
-            return {"error": "At least 2 data points required"}
-        
-        # 통계량 계산
-        stats_result = {
-            "N": len(data),
-            "Mean": float(np.mean(data)),
-            "Variance": float(np.var(data, ddof=1)),
-            "Std": float(np.std(data, ddof=1)),
-            "Median": float(np.median(data)),
-            "Min": float(np.min(data)),
-            "Max": float(np.max(data)),
-            "Range": float(np.max(data) - np.min(data)),
-            "Q1": float(np.percentile(data, 25)),
-            "Q3": float(np.percentile(data, 75)),
+        stats_dict = {
+            "데이터 수 (N)": len(data),
+            "평균 (Mean)": float(np.mean(data)),
+            "분산 (Variance)": float(np.var(data, ddof=1)),
+            "표준편차 (Std)": float(np.std(data, ddof=1)),
+            "중앙값 (Median)": float(np.median(data)),
+            "최솟값 (Min)": float(np.min(data)),
+            "최댓값 (Max)": float(np.max(data)),
+            "범위 (Range)": float(np.max(data) - np.min(data)),
+            "Q1 (25%)": float(np.percentile(data, 25)),
+            "Q3 (75%)": float(np.percentile(data, 75)),
         }
         
-        # 히스토그램 이미지 생성
-        fig, ax = plt.subplots(figsize=(8, 4))
-        sns.histplot(data, bins=30, kde=True, stat="density", color='skyblue', ax=ax)
-        ax.set_title("Histogram & Density Plot")
-        ax.set_xlabel("Value")
-        ax.set_ylabel("Density")
-        
-        # Base64로 변환
-        buf = io.BytesIO()
-        fig.savefig(buf, format="png", bbox_inches="tight", facecolor='white')
-        buf.seek(0)
-        img_base64 = base64.b64encode(buf.read()).decode("utf-8")
-        plt.close(fig)
-        
-        return {
-            "success": True,
-            "stats": stats_result,
-            "chart": img_base64
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-# ==========================================
-# 탭 3: 확률분포 그래프 엔드포인트
-# ==========================================
-@app.post("/api/probability-distribution")
-def probability_distribution(
-    dist_choice: str,
-    params: dict,
-    func_type: str = "PDF"
-):
-    """
-    이론적 확률분포 그래프를 그립니다.
-    
-    func_type: "PDF" 또는 "CDF"
-    """
-    try:
-        # 도메인 범위 설정
-        if "정규분포" in dist_choice:
-            mu, sigma = params["평균 (μ)"], params["표준편차 (σ)"]
-            x = np.linspace(mu - 4*sigma, mu + 4*sigma, 500)
-            y = stats.norm.pdf(x, mu, sigma) if func_type == "PDF" else stats.norm.cdf(x, mu, sigma)
-            
-        elif "지수분포" in dist_choice:
-            lam = params["비율 모수 (λ)"]
-            x = np.linspace(0, 10/lam, 500)
-            y = stats.expon.pdf(x, scale=1/lam) if func_type == "PDF" else stats.expon.cdf(x, scale=1/lam)
-            
-        elif "t-분포" in dist_choice:
-            df_val = int(params["자유도 (df)"])
-            x = np.linspace(-5, 5, 500)
-            y = stats.t.pdf(x, df_val) if func_type == "PDF" else stats.t.cdf(x, df_val)
-            
-        elif "카이제곱" in dist_choice:
-            df_val = int(params["자유도 (df)"])
-            x = np.linspace(0, max(20, df_val*3), 500)
-            y = stats.chi2.pdf(x, df_val) if func_type == "PDF" else stats.chi2.cdf(x, df_val)
-            
-        elif "포아송" in dist_choice:
-            lam = params["발생률 (λ)"]
-            x = np.arange(0, int(lam*3)+10)
-            y = stats.poisson.pmf(x, lam) if func_type == "PDF" else stats.poisson.cdf(x, lam)
-            
-        elif "이항분포" in dist_choice:
-            n_val = int(params["시행 횟수 (n)"])
-            p_val = params["성공 확률 (p)"]
-            x = np.arange(0, n_val+1)
-            y = stats.binom.pmf(x, n_val, p_val) if func_type == "PDF" else stats.binom.cdf(x, n_val, p_val)
-        else:
-            return {"error": "Unknown distribution"}
-        
-        # 그래프 생성
-        fig, ax = plt.subplots(figsize=(8, 5))
-        if "이항" in dist_choice or "포아송" in dist_choice:
-            ax.bar(x, y, color='#2E86AB', alpha=0.7, width=0.6)
-        else:
-            ax.plot(x, y, color='#2E86AB', linewidth=2.5)
-            ax.fill_between(x, y, alpha=0.15, color='#2E86AB')
-        
-        ax.set_title(f"{dist_choice} — {func_type}")
-        ax.set_xlabel("X")
-        ax.set_ylabel("Probability")
+        fig, ax = plt.subplots(figsize=(5, 3))
+        sns.histplot(data, bins=req.bins, kde=False, stat="density", color=req.bar_color, alpha=0.6, ax=ax)
+        sns.kdeplot(data, color=req.curve_color, linewidth=2, ax=ax)
+        ax.set_title("Histogram & Density (KDE)", fontsize=12, color='#1E3A5F')
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
         ax.grid(True, linestyle='--', alpha=0.4)
         
-        # Base64로 변환
-        buf = io.BytesIO()
-        fig.savefig(buf, format="png", bbox_inches="tight", facecolor='white')
-        buf.seek(0)
-        img_base64 = base64.b64encode(buf.read()).decode("utf-8")
-        plt.close(fig)
-        
-        return {
-            "success": True,
-            "chart": img_base64
-        }
+        return {"success": True, "stats": stats_dict, "image": fig_to_base64(fig)}
     except Exception as e:
         return {"error": str(e)}
 
-# ==========================================
-# 탭 4: 가설검정 & 추정 엔드포인트
-# ==========================================
-@app.post("/api/hypothesis-test")
-def hypothesis_test(
-    data: list,
-    h0_value: float,
-    analysis_type: str,
-    test_direction: str,
-    confidence_level: float
-):
-    """
-    모평균 또는 모분산 검정 및 신뢰구간 추정
-    
-    analysis_type: "mean" 또는 "variance"
-    test_direction: "two", "right", "left"
-    """
+# 3단계: 확률분포 그래프
+@app.post("/api/distribution")
+def distribution_graph(req: DistGraphRequest):
     try:
-        data = np.array(data)
-        data = data[np.isfinite(data)]
+        fig, ax = plt.subplots(figsize=(5, 3))
+        c = req.dist_choice
+        p = req.params
+        color = req.line_color
+        is_pdf = (req.func_type == "PDF")
         
-        if len(data) < 2:
-            return {"error": "Insufficient data"}
+        if "정규분포" in c:
+            mu, sigma = p["평균 (μ)"], p["표준편차 (σ)"]
+            x = np.linspace(mu - 4*sigma, mu + 4*sigma, 500)
+            y = stats.norm.pdf(x, mu, sigma) if is_pdf else stats.norm.cdf(x, mu, sigma)
+            ax.plot(x, y, color=color, linewidth=2.5)
+            ax.fill_between(x, y, alpha=0.15, color=color)
+        elif "지수분포" in c:
+            lam = p["비율 모수 (λ)"]
+            x = np.linspace(0, 10/lam, 500)
+            y = stats.expon.pdf(x, scale=1/lam) if is_pdf else stats.expon.cdf(x, scale=1/lam)
+            ax.plot(x, y, color=color, linewidth=2.5)
+            ax.fill_between(x, y, alpha=0.15, color=color)
+        elif "t-분포" in c:
+            df_val = p["자유도 (df)"]
+            x = np.linspace(-5, 5, 500)
+            y = stats.t.pdf(x, df_val) if is_pdf else stats.t.cdf(x, df_val)
+            ax.plot(x, y, color=color, linewidth=2.5)
+            ax.fill_between(x, y, alpha=0.15, color=color)
+        elif "카이제곱" in c:
+            df_val = p["자유도 (df)"]
+            x = np.linspace(0, max(20, df_val*3), 500)
+            y = stats.chi2.pdf(x, df_val) if is_pdf else stats.chi2.cdf(x, df_val)
+            ax.plot(x, y, color=color, linewidth=2.5)
+            ax.fill_between(x, y, alpha=0.15, color=color)
+        elif "포아송" in c:
+            lam = p["평균 발생률 (λ)"]
+            x = np.arange(0, int(lam*3)+10)
+            y = stats.poisson.pmf(x, lam) if is_pdf else stats.poisson.cdf(x, lam)
+            ax.bar(x, y, color=color, alpha=0.7, width=0.6)
+        elif "이항분포" in c:
+            n_val, p_val = int(p["시행 횟수 (n)"]), p["성공 확률 (p)"]
+            x = np.arange(0, n_val+1)
+            y = stats.binom.pmf(x, n_val, p_val) if is_pdf else stats.binom.cdf(x, n_val, p_val)
+            ax.bar(x, y, color=color, alpha=0.7, width=0.6)
+            
+        ax.set_title(f"{c} - {req.func_type}", fontsize=11, color='#1E3A5F')
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.grid(True, linestyle='--', alpha=0.4)
         
+        return {"success": True, "image": fig_to_base64(fig)}
+    except Exception as e:
+        return {"error": str(e)}
+
+# 4단계: 가설검정
+@app.post("/api/hypothesis")
+def hypothesis_test(req: HypothesisRequest):
+    try:
+        data = np.array(req.data)
         n = len(data)
-        alpha = 1 - (confidence_level / 100)
-        sample_mean = np.mean(data)
-        sample_var = np.var(data, ddof=1)
-        sample_std = np.std(data, ddof=1)
+        if n < 2: return {"error": "데이터가 부족합니다."}
         
-        if analysis_type == "mean":
-            se = np.sqrt(sample_var / n)
-            t_stat = (sample_mean - h0_value) / se
+        mean = np.mean(data)
+        var = np.var(data, ddof=1)
+        std = np.std(data, ddof=1)
+        
+        fig, ax = plt.subplots(figsize=(5, 3))
+        result_dict = {}
+        
+        if req.analysis_mode == "test":
+            se = np.sqrt(var / n)
+            t_stat = (mean - req.h0_val) / se
             df_val = n - 1
             
-            if test_direction == "two":
-                p_val = stats.t.sf(np.abs(t_stat), df_val) * 2
-                t_crit = stats.t.ppf(1 - alpha/2, df_val)
-            elif test_direction == "right":
-                p_val = stats.t.sf(t_stat, df_val)
-                t_crit = stats.t.isf(alpha, df_val)
-            else:  # left
-                p_val = stats.t.cdf(t_stat, df_val)
-                t_crit = stats.t.ppf(alpha, df_val)
+            if req.test_type == "two": p_val = stats.t.sf(abs(t_stat), df_val) * 2
+            elif req.test_type == "right": p_val = stats.t.sf(t_stat, df_val)
+            else: p_val = stats.t.cdf(t_stat, df_val)
             
-            margin = t_crit * se
-            ci_lower = sample_mean - margin
-            ci_upper = sample_mean + margin
+            t_crit = stats.t.ppf(1 - req.alpha/2, df_val)
+            ci_low = mean - t_crit * se
+            ci_high = mean + t_crit * se
             
-            # 그래프
-            fig, ax = plt.subplots(figsize=(8, 4))
+            result_dict = {
+                "t_stat": float(t_stat), "p_val": float(p_val),
+                "ci_low": float(ci_low), "ci_high": float(ci_high),
+                "rejected": bool(p_val < req.alpha)
+            }
+            
             x_plot = np.linspace(-5, 5, 500)
             y_plot = stats.t.pdf(x_plot, df_val)
             ax.plot(x_plot, y_plot, color='#2E86AB', linewidth=2)
-            ax.axvline(t_stat, color='#E74C3C', linewidth=2, linestyle='--', label=f't={t_stat:.2f}')
-            ax.set_title("t-Test Distribution")
-            ax.set_xlabel("Test Statistic")
-            ax.set_ylabel("Density")
-            ax.legend()
-            ax.grid(True, linestyle='--', alpha=0.4)
-            
-            buf = io.BytesIO()
-            fig.savefig(buf, format="png", bbox_inches="tight", facecolor='white')
-            buf.seek(0)
-            img_base64 = base64.b64encode(buf.read()).decode("utf-8")
-            plt.close(fig)
-            
-            return {
-                "success": True,
-                "test_stat": float(t_stat),
-                "p_value": float(p_val),
-                "ci_lower": float(ci_lower),
-                "ci_upper": float(ci_upper),
-                "rejected": bool(p_val < alpha),
-                "chart": img_base64
-            }
-        
-        else:  # variance
+            ax.axvline(t_stat, color='#E74C3C', linewidth=2, linestyle='--')
+            ax.set_title("t-Test", fontsize=11)
+        else:
             df_val = n - 1
-            chi2_stat = (df_val * sample_var) / h0_value
+            t_crit = stats.t.ppf(1 - req.alpha/2, df_val)
+            se_mean = std / np.sqrt(n)
+            chi2_low = stats.chi2.ppf(req.alpha/2, df_val)
+            chi2_high = stats.chi2.ppf(1 - req.alpha/2, df_val)
             
-            if test_direction == "two":
-                p_val = 2 * min(stats.chi2.cdf(chi2_stat, df_val), stats.chi2.sf(chi2_stat, df_val))
-            elif test_direction == "right":
-                p_val = stats.chi2.sf(chi2_stat, df_val)
-            else:
-                p_val = stats.chi2.cdf(chi2_stat, df_val)
-            
-            chi2_low = stats.chi2.ppf(alpha/2, df_val)
-            chi2_high = stats.chi2.isf(alpha/2, df_val)
-            ci_lower = (df_val * sample_var) / chi2_high
-            ci_upper = (df_val * sample_var) / chi2_low
-            
-            # 그래프
-            fig, ax = plt.subplots(figsize=(8, 4))
-            x_plot = np.linspace(0, max(chi2_stat * 1.5, df_val * 2.5), 500)
-            y_plot = stats.chi2.pdf(x_plot, df_val)
-            ax.plot(x_plot, y_plot, color='#2E86AB', linewidth=2)
-            ax.axvline(chi2_stat, color='#E74C3C', linewidth=2, linestyle='--', label=f'χ²={chi2_stat:.2f}')
-            ax.set_title("Chi-Square Distribution")
-            ax.set_xlabel("Test Statistic")
-            ax.set_ylabel("Density")
-            ax.legend()
-            ax.grid(True, linestyle='--', alpha=0.4)
-            
-            buf = io.BytesIO()
-            fig.savefig(buf, format="png", bbox_inches="tight", facecolor='white')
-            buf.seek(0)
-            img_base64 = base64.b64encode(buf.read()).decode("utf-8")
-            plt.close(fig)
-            
-            return {
-                "success": True,
-                "test_stat": float(chi2_stat),
-                "p_value": float(p_val),
-                "ci_lower": float(ci_lower),
-                "ci_upper": float(ci_upper),
-                "rejected": bool(p_val < alpha),
-                "chart": img_base64
+            result_dict = {
+                "mean": float(mean), "std": float(std),
+                "mean_ci_low": float(mean - t_crit * se_mean),
+                "mean_ci_high": float(mean + t_crit * se_mean),
+                "std_ci_low": float(np.sqrt(df_val * var / chi2_high)),
+                "std_ci_high": float(np.sqrt(df_val * var / chi2_low))
             }
-    
+            
+            x_plot = np.linspace(mean - 4*std, mean + 4*std, 500)
+            y_plot = stats.norm.pdf(x_plot, mean, std)
+            ax.plot(x_plot, y_plot, color='#2E86AB', linewidth=2)
+            ax.fill_between(x_plot, y_plot, alpha=0.15, color='#2E86AB')
+            ax.set_title("Estimation", fontsize=11)
+            
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        
+        return {"success": True, "results": result_dict, "image": fig_to_base64(fig)}
     except Exception as e:
         return {"error": str(e)}
 
-# ==========================================
-# 탭 5: 회귀분석 엔드포인트
-# ==========================================
-@app.post("/api/regression-analysis")
-def regression_analysis(
-    x_values: list,
-    y_values: list
-):
-    """
-    선형 회귀분석을 수행합니다.
-    """
+# 5단계: 회귀분석
+@app.post("/api/regression")
+def regression_analysis(req: RegressionRequest):
     try:
-        x = np.array(x_values)
-        y = np.array(y_values)
+        x = np.random.uniform(0, 10, req.n)
+        y = req.a * x + req.b + np.random.normal(0, req.sigma, req.n)
         
         res = stats.linregress(x, y)
-        slope = res.slope
-        intercept = res.intercept
-        r_value = res.rvalue
-        r_squared = r_value ** 2
-        p_value = res.pvalue
         
-        # 그래프
-        fig, ax = plt.subplots(figsize=(8, 5))
-        ax.scatter(x, y, color='#1f77b4', alpha=0.7, s=30, label='Data')
-        
+        fig, ax = plt.subplots(figsize=(5, 3))
+        ax.scatter(x, y, color='#2E86AB', alpha=0.6, s=30, edgecolors='none')
         x_line = np.linspace(np.min(x), np.max(x), 100)
-        y_line = slope * x_line + intercept
-        ax.plot(x_line, y_line, color='#d62728', linewidth=2.5, label=f'Regression: Y={slope:.2f}X+{intercept:.2f}')
-        
-        ax.set_xlabel("X")
-        ax.set_ylabel("Y")
-        ax.set_title("Linear Regression")
-        ax.legend()
-        ax.grid(True, linestyle='--', alpha=0.4)
-        
-        buf = io.BytesIO()
-        fig.savefig(buf, format="png", bbox_inches="tight", facecolor='white')
-        buf.seek(0)
-        img_base64 = base64.b64encode(buf.read()).decode("utf-8")
-        plt.close(fig)
+        ax.plot(x_line, res.slope * x_line + res.intercept, color='#E74C3C', linewidth=2.5)
+        ax.set_title("Linear Regression", fontsize=11)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
         
         return {
             "success": True,
-            "slope": float(slope),
-            "intercept": float(intercept),
-            "r_value": float(r_value),
-            "r_squared": float(r_squared),
-            "p_value": float(p_value),
-            "chart": img_base64
+            "slope": float(res.slope), "intercept": float(res.intercept),
+            "r": float(res.rvalue), "r2": float(res.rvalue**2), "p": float(res.pvalue),
+            "image": fig_to_base64(fig)
         }
     except Exception as e:
         return {"error": str(e)}
-
-# ==========================================
-# 헬스 체크
-# ==========================================
-@app.get("/")
-def read_root():
-    return {
-        "message": "Statistics Learning API Server is running!",
-        "version": "1.0"
-    }
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
