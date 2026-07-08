@@ -49,6 +49,7 @@ class HypothesisRequest(BaseModel):
     analysis_mode: str
     test_type: str
     alpha: float
+    target_metric: str = "mean"  # 이 줄이 추가됨
 
 class RegressionRequest(BaseModel):
     a: float
@@ -182,7 +183,7 @@ def distribution_graph(req: DistGraphRequest):
     except Exception as e:
         return {"error": str(e)}
 
-# 4단계: 가설검정
+# 4단계: 가설검정 (평균 & 표준편차 지원)
 @app.post("/api/hypothesis")
 def hypothesis_test(req: HypothesisRequest):
     try:
@@ -197,58 +198,111 @@ def hypothesis_test(req: HypothesisRequest):
         fig, ax = plt.subplots(figsize=(5, 3))
         result_dict = {}
         
-        if req.analysis_mode == "test":
+        # --- A. 타겟이 '평균'인 경우 (t-분포) ---
+        if req.target_metric == "mean":
             se = np.sqrt(var / n)
-            t_stat = (mean - req.h0_val) / se
             df_val = n - 1
             
-            if req.test_type == "two": p_val = stats.t.sf(abs(t_stat), df_val) * 2
-            elif req.test_type == "right": p_val = stats.t.sf(t_stat, df_val)
-            else: p_val = stats.t.cdf(t_stat, df_val)
+            if req.analysis_mode == "test":
+                t_stat = (mean - req.h0_val) / se
+                if req.test_type == "two": p_val = stats.t.sf(abs(t_stat), df_val) * 2
+                elif req.test_type == "right": p_val = stats.t.sf(t_stat, df_val)
+                else: p_val = stats.t.cdf(t_stat, df_val)
+                
+                t_crit = stats.t.ppf(1 - req.alpha/2, df_val)
+                ci_low = mean - t_crit * se
+                ci_high = mean + t_crit * se
+                
+                result_dict = {
+                    "stat_val": float(t_stat), "p_val": float(p_val),
+                    "ci_low": float(ci_low), "ci_high": float(ci_high),
+                    "rejected": bool(p_val < req.alpha),
+                    "target_name": "t-통계량 / t-stat"
+                }
+                
+                x_plot = np.linspace(-5, 5, 500)
+                y_plot = stats.t.pdf(x_plot, df_val)
+                ax.plot(x_plot, y_plot, color='#2E86AB', linewidth=2)
+                ax.axvline(t_stat, color='#E74C3C', linewidth=2, linestyle='--')
+                ax.set_title("t-Test (Mean)", fontsize=11)
             
-            t_crit = stats.t.ppf(1 - req.alpha/2, df_val)
-            ci_low = mean - t_crit * se
-            ci_high = mean + t_crit * se
-            
-            result_dict = {
-                "t_stat": float(t_stat), "p_val": float(p_val),
-                "ci_low": float(ci_low), "ci_high": float(ci_high),
-                "rejected": bool(p_val < req.alpha)
-            }
-            
-            x_plot = np.linspace(-5, 5, 500)
-            y_plot = stats.t.pdf(x_plot, df_val)
-            ax.plot(x_plot, y_plot, color='#2E86AB', linewidth=2)
-            ax.axvline(t_stat, color='#E74C3C', linewidth=2, linestyle='--')
-            ax.set_title("t-Test", fontsize=11)
-        else:
+            else: # estimate
+                t_crit = stats.t.ppf(1 - req.alpha/2, df_val)
+                ci_low = mean - t_crit * se
+                ci_high = mean + t_crit * se
+                
+                result_dict = {
+                    "est_val": float(mean),
+                    "ci_low": float(ci_low), "ci_high": float(ci_high),
+                    "target_name": "표본평균 / Mean"
+                }
+                
+                x_plot = np.linspace(mean - 4*std, mean + 4*std, 500)
+                y_plot = stats.norm.pdf(x_plot, mean, std)
+                ax.plot(x_plot, y_plot, color='#2E86AB', linewidth=2)
+                ax.fill_between(x_plot, y_plot, alpha=0.15, color='#2E86AB')
+                ax.set_title("Estimation (Mean)", fontsize=11)
+
+        # --- B. 타겟이 '표준편차'인 경우 (카이제곱 분포) ---
+        else: 
             df_val = n - 1
-            t_crit = stats.t.ppf(1 - req.alpha/2, df_val)
-            se_mean = std / np.sqrt(n)
-            chi2_low = stats.chi2.ppf(req.alpha/2, df_val)
-            chi2_high = stats.chi2.ppf(1 - req.alpha/2, df_val)
             
-            result_dict = {
-                "mean": float(mean), "std": float(std),
-                "mean_ci_low": float(mean - t_crit * se_mean),
-                "mean_ci_high": float(mean + t_crit * se_mean),
-                "std_ci_low": float(np.sqrt(df_val * var / chi2_high)),
-                "std_ci_high": float(np.sqrt(df_val * var / chi2_low))
-            }
-            
-            x_plot = np.linspace(mean - 4*std, mean + 4*std, 500)
-            y_plot = stats.norm.pdf(x_plot, mean, std)
-            ax.plot(x_plot, y_plot, color='#2E86AB', linewidth=2)
-            ax.fill_between(x_plot, y_plot, alpha=0.15, color='#2E86AB')
-            ax.set_title("Estimation", fontsize=11)
-            
+            if req.analysis_mode == "test":
+                h0_var = req.h0_val ** 2
+                if h0_var == 0: return {"error": "귀무가설 표준편차가 0일 수 없습니다."}
+                
+                chi2_stat = df_val * var / h0_var
+                
+                if req.test_type == "two":
+                    p_val = 2 * min(stats.chi2.cdf(chi2_stat, df_val), stats.chi2.sf(chi2_stat, df_val))
+                elif req.test_type == "right": 
+                    p_val = stats.chi2.sf(chi2_stat, df_val)
+                else: 
+                    p_val = stats.chi2.cdf(chi2_stat, df_val)
+                    
+                chi2_low = stats.chi2.ppf(req.alpha/2, df_val)
+                chi2_high = stats.chi2.ppf(1 - req.alpha/2, df_val)
+                ci_low = np.sqrt(df_val * var / chi2_high)
+                ci_high = np.sqrt(df_val * var / chi2_low)
+
+                result_dict = {
+                    "stat_val": float(chi2_stat), "p_val": float(p_val),
+                    "ci_low": float(ci_low), "ci_high": float(ci_high),
+                    "rejected": bool(p_val < req.alpha),
+                    "target_name": "카이제곱 통계량 / Chi2-stat"
+                }
+                
+                x_plot = np.linspace(0, max(chi2_stat*1.5, stats.chi2.ppf(0.99, df_val)), 500)
+                y_plot = stats.chi2.pdf(x_plot, df_val)
+                ax.plot(x_plot, y_plot, color='#047857', linewidth=2)
+                ax.axvline(chi2_stat, color='#E74C3C', linewidth=2, linestyle='--')
+                ax.set_title("Chi-Square Test (Std Dev)", fontsize=11)
+                
+            else: # estimate
+                chi2_low = stats.chi2.ppf(req.alpha/2, df_val)
+                chi2_high = stats.chi2.ppf(1 - req.alpha/2, df_val)
+                ci_low = np.sqrt(df_val * var / chi2_high)
+                ci_high = np.sqrt(df_val * var / chi2_low)
+
+                result_dict = {
+                    "est_val": float(std),
+                    "ci_low": float(ci_low), "ci_high": float(ci_high),
+                    "target_name": "표본표준편차 / Std Dev"
+                }
+                
+                x_plot = np.linspace(0, max(std*2, stats.chi2.ppf(0.99, df_val)), 500)
+                y_plot = stats.chi2.pdf(x_plot, df_val)
+                ax.plot(x_plot, y_plot, color='#047857', linewidth=2)
+                ax.fill_between(x_plot, y_plot, alpha=0.15, color='#047857')
+                ax.set_title("Estimation (Std Dev)", fontsize=11)
+
         ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
         
         return {"success": True, "results": result_dict, "image": fig_to_base64(fig)}
     except Exception as e:
         return {"error": str(e)}
-
+        
 # 5단계: 회귀분석
 @app.post("/api/regression")
 def regression_analysis(req: RegressionRequest):
